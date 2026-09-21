@@ -340,9 +340,9 @@ export const updateCampaign = async (id, data) => http.put(
   { loading: models.campaigns },
 );
 
-export const changeCampaignStatus = async (id, status) => http.put(
+export const changeCampaignStatus = async (id, status, reason = '') => http.put(
   `/api/campaigns/${id}/status`,
-  { status },
+  { status, reason },
 
   { loading: models.campaigns },
 );

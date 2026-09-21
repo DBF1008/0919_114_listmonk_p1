@@ -360,13 +360,14 @@ func (a *App) UpdateCampaignStatus(c echo.Context) error {
 
 	req := struct {
 		Status string `json:"status"`
+		Reason string `json:"reason"`
 	}{}
 	if err := c.Bind(&req); err != nil {
 		return err
 	}
 
 	// Update the campaign status in the DB.
-	out, err := a.core.UpdateCampaignStatus(id, req.Status)
+	out, err := a.core.UpdateCampaignStatus(id, req.Status, req.Reason)
 	if err != nil {
 		return err
 	}

@@ -107,6 +107,8 @@ CREATE TABLE campaigns (
     attribs          JSONB NOT NULL DEFAULT '{}',
     status           campaign_status NOT NULL DEFAULT 'draft',
     tags             VARCHAR(100)[],
+    -- Reason recorded when a campaign is paused (eg: auto-paused on send errors).
+    pause_reason     TEXT NULL,
 
     -- The subscription statuses of subscribers to which a campaign will be sent.
     -- For opt-in campaigns, this will be 'unsubscribed'.

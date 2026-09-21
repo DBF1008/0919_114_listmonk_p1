@@ -1539,6 +1539,9 @@ paths:
                 status:
                   type: string
                   enum: [scheduled, running, paused, cancelled]
+                reason:
+                  type: string
+                  description: Optional reason recorded as the campaign's pause reason when the status is 'paused'
       responses:
         "200":
           description: response

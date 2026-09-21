@@ -6,6 +6,9 @@
           <b-tag v-if="isEditing" :class="data.status">
             {{ $t(`campaigns.status.${data.status}`) }}
           </b-tag>
+          <b-tag v-if="data.status === 'paused' && data.pauseReason" class="is-warning" data-cy="pause-reason">
+            {{ data.pauseReason }}
+          </b-tag>
           <b-tag v-if="data.type === 'optin'" :class="data.type">
             {{ $t('lists.optin') }}
           </b-tag>

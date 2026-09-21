@@ -10,6 +10,59 @@ import (
 	"github.com/paulbellamy/ratecounter"
 )
 
+// pauseReasonTooManyErrors is recorded as the pause reason when a campaign
+// is auto-paused after exceeding the send error threshold.
+const pauseReasonTooManyErrors = "Too many send errors"
+
+// slidingWindow implements a per-campaign (per-pipe) rate limiting window.
+// It keeps track of the number of messages sent in a period and on reaching
+// the specified limit, asks the caller to wait until the window is over
+// before sending further messages. The counter and the window start are
+// guarded by a mutex so that concurrent senders observe a consistent state.
+type slidingWindow struct {
+	mu     sync.Mutex
+	count  int
+	start  time.Time
+	rate   int
+	window time.Duration
+}
+
+// newSlidingWindow returns a slidingWindow that allows rate messages per window.
+func newSlidingWindow(rate int, window time.Duration) *slidingWindow {
+	return &slidingWindow{
+		start:  time.Now(),
+		rate:   rate,
+		window: window,
+	}
+}
+
+// throttle atomically registers one message in the window and returns the
+// duration the caller should wait before proceeding. It returns 0 if the
+// message can be sent immediately. The check-and-increment is performed
+// under a lock so concurrent callers can't over-shoot the window's rate.
+func (s *slidingWindow) throttle(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	diff := now.Sub(s.start)
+
+	// Window has expired. Reset the clock.
+	if diff >= s.window {
+		s.start = now
+		s.count = 0
+		diff = 0
+	}
+
+	// Have the messages exceeded the limit?
+	s.count++
+	if s.count >= s.rate {
+		s.count = 0
+		return s.window - diff
+	}
+
+	return 0
+}
+
 type pipe struct {
 	camp       *models.Campaign
 	rate       *ratecounter.RateCounter
@@ -20,6 +73,12 @@ type pipe struct {
 	stopped    atomic.Bool
 	withErrors atomic.Bool
 
+	// Per-campaign sliding window rate limiter. nil if disabled.
+	sliding *slidingWindow
+
+	// Reason recorded when the campaign is auto-paused (eg: too many errors).
+	pauseReason atomic.Value
+
 	m *Manager
 }
 
@@ -27,7 +86,7 @@ type pipe struct {
 func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
 	// Validate messenger.
 	if _, ok := m.messengers[c.Messenger]; !ok {
-		m.store.UpdateCampaignStatus(c.ID, models.CampaignStatusCancelled)
+		m.store.UpdateCampaignStatus(c.ID, models.CampaignStatusCancelled, "")
 		return nil, fmt.Errorf("unknown messenger %s on campaign %s", c.Messenger, c.Name)
 	}
 
@@ -47,6 +106,15 @@ func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
 		rate: ratecounter.NewRateCounter(time.Minute),
 		wg:   &sync.WaitGroup{},
 		m:    m,
+	}
+
+	// Attach a per-campaign sliding window rate limiter if it's enabled.
+	// Every pipe gets its own independent window so that one campaign's
+	// send rate doesn't throttle other concurrently running campaigns.
+	if m.cfg.SlidingWindow &&
+		m.cfg.SlidingWindowRate > 0 &&
+		m.cfg.SlidingWindowDuration.Seconds() > 1 {
+		p.sliding = newSlidingWindow(m.cfg.SlidingWindowRate, m.cfg.SlidingWindowDuration)
 	}
 
 	// Increment the waitgroup so that Wait() blocks immediately. This is necessary
@@ -86,11 +154,6 @@ func (p *pipe) NextSubscribers() (bool, error) {
 		return false, nil
 	}
 
-	// Is there a sliding window limit configured?
-	hasSliding := p.m.cfg.SlidingWindow &&
-		p.m.cfg.SlidingWindowRate > 0 &&
-		p.m.cfg.SlidingWindowDuration.Seconds() > 1
-
 	// Push messages.
 	for _, s := range subs {
 		msg, err := p.newMessage(s)
@@ -103,28 +166,17 @@ func (p *pipe) NextSubscribers() (bool, error) {
 		// the queue is drained.
 		p.m.campMsgQ <- msg
 
-		// Check if the sliding window is active.
-		if hasSliding {
-			diff := time.Since(p.m.slidingStart)
-
-			// Window has expired. Reset the clock.
-			if diff >= p.m.cfg.SlidingWindowDuration {
-				p.m.slidingStart = time.Now()
-				p.m.slidingCount = 0
-			}
-
-			// Have the messages exceeded the limit?
-			p.m.slidingCount++
-			if p.m.slidingCount >= p.m.cfg.SlidingWindowRate {
-				wait := p.m.cfg.SlidingWindowDuration - diff
-
-				p.m.log.Printf("messages exceeded (%d) for the window (%v since %s). Sleeping for %s.",
-					p.m.slidingCount,
+		// Check if this campaign's sliding window is active. The window
+		// check-and-increment is atomic; only the sleep happens outside
+		// the lock so other pipes aren't blocked while waiting.
+		if p.sliding != nil {
+			if wait := p.sliding.throttle(time.Now()); wait > 0 {
+				p.m.log.Printf("campaign (%s) exceeded %d messages for the window (%v). Sleeping for %s.",
+					p.camp.Name,
+					p.m.cfg.SlidingWindowRate,
 					p.m.cfg.SlidingWindowDuration,
-					p.m.slidingStart.Format(time.RFC822Z),
-					wait.Round(time.Second)*1)
+					wait.Round(time.Second))
 
-				p.m.slidingCount = 0
 				time.Sleep(wait)
 			}
 		}
@@ -161,6 +213,7 @@ func (p *pipe) Stop(withErrors bool) {
 
 	if withErrors {
 		p.withErrors.Store(true)
+		p.pauseReason.Store(pauseReasonTooManyErrors)
 	}
 
 	p.stopped.Store(true)
@@ -198,13 +251,14 @@ func (p *pipe) cleanup() {
 
 	// The campaign was auto-paused due to errors.
 	if p.withErrors.Load() {
-		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusPaused); err != nil {
+		reason, _ := p.pauseReason.Load().(string)
+		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusPaused, reason); err != nil {
 			p.m.log.Printf("error updating campaign (%s) status to %s: %v", p.camp.Name, models.CampaignStatusPaused, err)
 		} else {
 			p.m.log.Printf("set campaign (%s) to %s", p.camp.Name, models.CampaignStatusPaused)
 		}
 
-		_ = p.m.sendNotif(p.camp, models.CampaignStatusPaused, "Too many errors")
+		_ = p.m.sendNotif(p.camp, models.CampaignStatusPaused, reason)
 		return
 	}
 
@@ -225,7 +279,7 @@ func (p *pipe) cleanup() {
 	// If a running campaign has exhausted subscribers, it's finished.
 	if c.Status == models.CampaignStatusRunning || c.Status == models.CampaignStatusScheduled {
 		c.Status = models.CampaignStatusFinished
-		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusFinished); err != nil {
+		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusFinished, ""); err != nil {
 			p.m.log.Printf("error finishing campaign (%s): %v", p.camp.Name, err)
 		} else {
 			p.m.log.Printf("campaign (%s) finished", p.camp.Name)

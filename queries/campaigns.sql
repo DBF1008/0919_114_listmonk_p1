@@ -448,6 +448,9 @@ UPDATE campaigns SET
             ELSE $2::campaign_status
         END
     ),
+    -- Record the reason when a campaign is paused (eg: auto-paused on send
+    -- errors) and clear it on any other status transition.
+    pause_reason=(CASE WHEN $2 = 'paused' THEN NULLIF($3, '') ELSE NULL END),
     updated_at=NOW()
 WHERE id = $1;
 
