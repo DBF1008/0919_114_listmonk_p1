@@ -106,6 +106,7 @@ CREATE TABLE campaigns (
     headers          JSONB NOT NULL DEFAULT '[]',
     attribs          JSONB NOT NULL DEFAULT '{}',
     status           campaign_status NOT NULL DEFAULT 'draft',
+    status_reason    TEXT NULL,
     tags             VARCHAR(100)[],
 
     -- The subscription statuses of subscribers to which a campaign will be sent.

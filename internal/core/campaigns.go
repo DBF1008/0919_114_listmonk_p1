@@ -247,7 +247,9 @@ func (c *Core) UpdateCampaign(id int, o models.Campaign, listIDs []int, mediaIDs
 }
 
 // UpdateCampaignStatus updates a campaign's status, eg: draft to running.
-func (c *Core) UpdateCampaignStatus(id int, status string) (models.Campaign, error) {
+// reason is an optional note recorded with the status change (eg: the reason
+// a campaign was paused).
+func (c *Core) UpdateCampaignStatus(id int, status string, reason string) (models.Campaign, error) {
 	cm, err := c.GetCampaign(id, "", "")
 	if err != nil {
 		return models.Campaign{}, err
@@ -285,7 +287,7 @@ func (c *Core) UpdateCampaignStatus(id int, status string) (models.Campaign, err
 		return models.Campaign{}, echo.NewHTTPError(http.StatusBadRequest, errMsg)
 	}
 
-	res, err := c.q.UpdateCampaignStatus.Exec(cm.ID, status)
+	res, err := c.q.UpdateCampaignStatus.Exec(cm.ID, status, reason)
 	if err != nil {
 		c.log.Printf("error updating campaign status: %v", err)
 

@@ -448,6 +448,15 @@ UPDATE campaigns SET
             ELSE $2::campaign_status
         END
     ),
+    -- Record the reason when a campaign is paused (eg: auto-paused on
+    -- send errors) and clear it when the campaign resumes.
+    status_reason=(
+        CASE
+            WHEN $2 = 'paused' AND NULLIF($3, '') IS NOT NULL THEN $3
+            WHEN $2 = 'running' THEN NULL
+            ELSE status_reason
+        END
+    ),
     updated_at=NOW()
 WHERE id = $1;
 
@@ -486,4 +495,3 @@ WITH view AS (
 )
 INSERT INTO campaign_views (campaign_id, subscriber_id)
     VALUES((SELECT campaign_id FROM view), (SELECT subscriber_id FROM view));
-

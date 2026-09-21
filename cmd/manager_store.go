@@ -74,8 +74,8 @@ func (s *store) GetCampaign(campID int) (*models.Campaign, error) {
 }
 
 // UpdateCampaignStatus updates a campaign's status.
-func (s *store) UpdateCampaignStatus(campID int, status string) error {
-	_, err := s.queries.UpdateCampaignStatus.Exec(campID, status)
+func (s *store) UpdateCampaignStatus(campID int, status string, reason string) error {
+	_, err := s.queries.UpdateCampaignStatus.Exec(campID, status, reason)
 	return err
 }
 

@@ -20,14 +20,59 @@ type pipe struct {
 	stopped    atomic.Bool
 	withErrors atomic.Bool
 
+	// Per-campaign sliding window rate limiter. nil if not configured.
+	sliding *slidingWindow
+
 	m *Manager
+}
+
+// pauseReasonTooManyErrors is the reason recorded when a campaign is
+// auto-paused after exceeding the max send error threshold.
+const pauseReasonTooManyErrors = "too many errors"
+
+// slidingWindow is a per-campaign rate limiter that tracks the number of
+// messages queued within a fixed time window. The check-and-reserve
+// operation is guarded by a mutex so that concurrent goroutines can't
+// over-queue beyond the configured limit.
+type slidingWindow struct {
+	mu     sync.Mutex
+	count  int
+	start  time.Time
+	limit  int
+	window time.Duration
+}
+
+// reserve atomically checks the current window and reserves a slot in it.
+// If the window is exhausted, it returns false along with the duration
+// to wait before the window resets.
+func (w *slidingWindow) reserve() (time.Duration, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	now := time.Now()
+	diff := now.Sub(w.start)
+
+	// The window has expired. Reset it.
+	if diff >= w.window {
+		w.start = now
+		w.count = 0
+		diff = 0
+	}
+
+	// The window is exhausted. Wait for it to reset.
+	if w.count >= w.limit {
+		return w.window - diff, false
+	}
+
+	w.count++
+	return 0, true
 }
 
 // newPipe adds a campaign to the process queue.
 func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
 	// Validate messenger.
 	if _, ok := m.messengers[c.Messenger]; !ok {
-		m.store.UpdateCampaignStatus(c.ID, models.CampaignStatusCancelled)
+		m.store.UpdateCampaignStatus(c.ID, models.CampaignStatusCancelled, "")
 		return nil, fmt.Errorf("unknown messenger %s on campaign %s", c.Messenger, c.Name)
 	}
 
@@ -47,6 +92,19 @@ func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
 		rate: ratecounter.NewRateCounter(time.Minute),
 		wg:   &sync.WaitGroup{},
 		m:    m,
+	}
+
+	// Attach a per-campaign sliding window rate limiter if configured.
+	// Each pipe tracks its own window so that one campaign's send rate
+	// doesn't affect another's.
+	if m.cfg.SlidingWindow &&
+		m.cfg.SlidingWindowRate > 0 &&
+		m.cfg.SlidingWindowDuration.Seconds() > 1 {
+		p.sliding = &slidingWindow{
+			start:  time.Now(),
+			limit:  m.cfg.SlidingWindowRate,
+			window: m.cfg.SlidingWindowDuration,
+		}
 	}
 
 	// Increment the waitgroup so that Wait() blocks immediately. This is necessary
@@ -86,11 +144,6 @@ func (p *pipe) NextSubscribers() (bool, error) {
 		return false, nil
 	}
 
-	// Is there a sliding window limit configured?
-	hasSliding := p.m.cfg.SlidingWindow &&
-		p.m.cfg.SlidingWindowRate > 0 &&
-		p.m.cfg.SlidingWindowDuration.Seconds() > 1
-
 	// Push messages.
 	for _, s := range subs {
 		msg, err := p.newMessage(s)
@@ -99,38 +152,36 @@ func (p *pipe) NextSubscribers() (bool, error) {
 			continue
 		}
 
+		// If a sliding window limit is configured, atomically reserve a slot
+		// in this campaign's own window before queueing the message. This
+		// blocks until a slot frees up, keeping the reservation and the
+		// queue push serialized so that the window count can't be overrun
+		// by concurrent workers.
+		if p.sliding != nil {
+			p.waitSlidingWindow()
+		}
+
 		// Push the message to the queue while blocking and waiting until
 		// the queue is drained.
 		p.m.campMsgQ <- msg
-
-		// Check if the sliding window is active.
-		if hasSliding {
-			diff := time.Since(p.m.slidingStart)
-
-			// Window has expired. Reset the clock.
-			if diff >= p.m.cfg.SlidingWindowDuration {
-				p.m.slidingStart = time.Now()
-				p.m.slidingCount = 0
-			}
-
-			// Have the messages exceeded the limit?
-			p.m.slidingCount++
-			if p.m.slidingCount >= p.m.cfg.SlidingWindowRate {
-				wait := p.m.cfg.SlidingWindowDuration - diff
-
-				p.m.log.Printf("messages exceeded (%d) for the window (%v since %s). Sleeping for %s.",
-					p.m.slidingCount,
-					p.m.cfg.SlidingWindowDuration,
-					p.m.slidingStart.Format(time.RFC822Z),
-					wait.Round(time.Second)*1)
-
-				p.m.slidingCount = 0
-				time.Sleep(wait)
-			}
-		}
 	}
 
 	return true, nil
+}
+
+// waitSlidingWindow blocks until a slot is available in the pipe's sliding
+// window and reserves it.
+func (p *pipe) waitSlidingWindow() {
+	for {
+		wait, ok := p.sliding.reserve()
+		if ok {
+			return
+		}
+
+		p.m.log.Printf("campaign (%s) exceeded %d messages for the window (%v). Sleeping for %s.",
+			p.camp.Name, p.sliding.limit, p.sliding.window, wait.Round(time.Second))
+		time.Sleep(wait)
+	}
 }
 
 // OnError keeps track of the number of errors that occur while sending messages
@@ -198,13 +249,13 @@ func (p *pipe) cleanup() {
 
 	// The campaign was auto-paused due to errors.
 	if p.withErrors.Load() {
-		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusPaused); err != nil {
+		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusPaused, pauseReasonTooManyErrors); err != nil {
 			p.m.log.Printf("error updating campaign (%s) status to %s: %v", p.camp.Name, models.CampaignStatusPaused, err)
 		} else {
 			p.m.log.Printf("set campaign (%s) to %s", p.camp.Name, models.CampaignStatusPaused)
 		}
 
-		_ = p.m.sendNotif(p.camp, models.CampaignStatusPaused, "Too many errors")
+		_ = p.m.sendNotif(p.camp, models.CampaignStatusPaused, pauseReasonTooManyErrors)
 		return
 	}
 
@@ -225,7 +276,7 @@ func (p *pipe) cleanup() {
 	// If a running campaign has exhausted subscribers, it's finished.
 	if c.Status == models.CampaignStatusRunning || c.Status == models.CampaignStatusScheduled {
 		c.Status = models.CampaignStatusFinished
-		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusFinished); err != nil {
+		if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusFinished, ""); err != nil {
 			p.m.log.Printf("error finishing campaign (%s): %v", p.camp.Name, err)
 		} else {
 			p.m.log.Printf("campaign (%s) finished", p.camp.Name)

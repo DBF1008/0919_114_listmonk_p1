@@ -77,6 +77,12 @@
               {{ $utils.niceDate(props.row.sendAt, true) }}
             </span>
           </p>
+          <p v-if="props.row.status === 'paused' && props.row.statusReason">
+            <span class="is-size-7 has-text-grey status-reason" :title="props.row.statusReason">
+              <b-icon icon="information-outline" size="is-small" />
+              {{ props.row.statusReason }}
+            </span>
+          </p>
         </div>
       </b-table-column>
       <b-table-column v-slot="props" field="name" :label="$t('globals.fields.name')" width="25%" sortable

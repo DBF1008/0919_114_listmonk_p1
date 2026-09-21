@@ -360,13 +360,19 @@ func (a *App) UpdateCampaignStatus(c echo.Context) error {
 
 	req := struct {
 		Status string `json:"status"`
+		Reason string `json:"reason"`
 	}{}
 	if err := c.Bind(&req); err != nil {
 		return err
 	}
 
+	if len(req.Reason) > stdInputMaxLen {
+		return echo.NewHTTPError(http.StatusBadRequest,
+			a.i18n.Ts("globals.messages.invalidFields", "name", "reason"))
+	}
+
 	// Update the campaign status in the DB.
-	out, err := a.core.UpdateCampaignStatus(id, req.Status)
+	out, err := a.core.UpdateCampaignStatus(id, req.Status, req.Reason)
 	if err != nil {
 		return err
 	}

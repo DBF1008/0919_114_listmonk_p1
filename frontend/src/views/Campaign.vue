@@ -13,6 +13,10 @@
             {{ $t('globals.fields.id') }}: <copy-text :text="`${data.id}`" />
             {{ $t('globals.fields.uuid') }}: <copy-text :text="data.uuid" />
           </span>
+          <b-tag v-if="isEditing && data.status === 'paused' && data.statusReason"
+            type="is-light" class="status-reason" :title="data.statusReason">
+            {{ data.statusReason }}
+          </b-tag>
         </p>
         <h4 v-if="isEditing" class="title is-4">
           {{ data.name }}
